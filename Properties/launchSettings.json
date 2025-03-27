@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "FileMunger": {
+      "commandName": "Project",
+      "commandLineArgs": "c:\\,d:\\download\r\n\r\n"
+    }
+  }
+}
