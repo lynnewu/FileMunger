@@ -21,67 +21,15 @@ namespace FileMunger {
 	/// - Windows-optimized file access
 	/// </summary>
 	static public class Program {
-		/// <summary>
-		/// Entry point for the FileMunger application.
-		/// </summary>
-		/// <param name="args">Command line arguments. First argument should be the root directory path to process.</param>
-		//static async Task Main(String[] args) {
-		//	// Initialize logging
-		//	Logger.Initialize(LogLevel.Debug);
-		//	Logger.LogInfo("FileMunger starting up...");
-		//	Logger.LogDebug($"Running on .NET version: {Environment.Version}");
-
-		//	// Validate command line arguments
-		//	if (args.Length == 0) {
-		//		Logger.LogError("No directory path provided. Usage: FileMunger.exe [directory_path]");
-		//		Console.WriteLine("Please provide a directory path to scan");
-		//		return;
-		//	}
-
-		//	String rootDirectory = args[0];
-
-		//	// Verify the directory exists
-		//	if (!Directory.Exists(rootDirectory)) {
-		//		Logger.LogError($"Directory not found: {rootDirectory}");
-		//		Console.WriteLine($"Directory not found: {rootDirectory}");
-		//		return;
-		//	}
-
-		//	Logger.LogInfo($"Starting processing of directory: {rootDirectory}");
-
-		//	// Create performance tracker
-		//	PerformanceTracker performanceTracker = new PerformanceTracker();
-		//	performanceTracker.Start();
-
-		//	// Create and configure I/O throttler
-		//	IoPerformanceThrottler ioThrottler = new IoPerformanceThrottler();
-
-		//	try {
-		//		// Process the directory hierarchy
-		//		await ProcessDirectoryAsync(rootDirectory, ioThrottler);
-
-		//		// Log completion statistics
-		//		performanceTracker.Stop();
-		//		Logger.LogInfo($"Processing complete in {performanceTracker.ElapsedTime.TotalSeconds:F2} seconds");
-		//		Logger.LogInfo($"Peak memory usage: {performanceTracker.PeakMemoryUsageMB:F2} MB");
-		//	}
-		//	catch (Exception ex) {
-		//		Logger.LogError($"Unhandled exception in main processing: {ex}");
-		//		Console.WriteLine("An error occurred during processing. Check logs for details.");
-		//	}
-
-		//	Console.WriteLine("Processing complete!");
-		//}
 
 		/// <summary>
 		/// Entry point for the FileMunger application.
 		/// </summary>
 		/// <param name="args">Command line arguments. First argument contains comma-separated directory paths to process.</param>
 		static async Task Main(String[] args) {
-			// Initialize logging
-			Logger.Initialize(LogLevel.Debug);
-			Logger.LogInfo("FileMunger starting up...");
-			Logger.LogDebug($"Running on .NET version: {Environment.Version}");
+			// Initialize logging with minimal logging for performance
+			Logger.Initialize(LogLevel.Info);
+			Logger.LogInfo("FileMunger starting up with high-performance parallel configuration");
 
 			// Validate command line arguments
 			if (args.Length == 0) {
@@ -90,7 +38,7 @@ namespace FileMunger {
 				return;
 			}
 
-			// Split the comma-separated paths and validate each one
+			// Split the comma-separated paths
 			String[] directoryPaths = args[0].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
 			if (directoryPaths.Length == 0) {
@@ -99,19 +47,8 @@ namespace FileMunger {
 				return;
 			}
 
-			// Verify each directory exists and build a list of valid ones
-			List<String> validDirectories = new List<String>();
-
-			foreach (String directory in directoryPaths) {
-				if (Directory.Exists(directory)) {
-					validDirectories.Add(directory);
-					Logger.LogInfo($"Validated directory: {directory}");
-				}
-				else {
-					Logger.LogWarning($"Directory not found, will be skipped: {directory}");
-					Console.WriteLine($"Warning: Directory not found, will be skipped: {directory}");
-				}
-			}
+			// Verify each directory exists
+			List<String> validDirectories = directoryPaths.Where(Directory.Exists).ToList();
 
 			if (validDirectories.Count == 0) {
 				Logger.LogError("No valid directories to process");
@@ -119,72 +56,280 @@ namespace FileMunger {
 				return;
 			}
 
-			// Group directories by drive letter to process separate drives in parallel
-			var directoriesByDrive = validDirectories
-					.GroupBy(path => {
-						try {
-							// Get the drive information for the path
-							return Path.GetFullPath(path).Substring(0, 1).ToUpper();
-						}
-						catch {
-							// If there's any issue, use a placeholder
-							return "?";
-						}
-					})
-					.ToDictionary(g => g.Key, g => g.ToList());
+			// Get system information for optimizing parallelism
+			Int32 processorCount = Environment.ProcessorCount;
+			Int64 availableMemoryMB = GetAvailableMemoryMB();
 
-			Logger.LogInfo($"Found {validDirectories.Count} valid directories across {directoriesByDrive.Count} drives");
+			Logger.LogInfo($"System has {processorCount} logical processors and {availableMemoryMB} MB available memory");
 
-			foreach (var drive in directoriesByDrive) {
-				Logger.LogInfo($"Drive {drive.Key}: {drive.Value.Count} directories to process");
-			}
+			// High performance settings - significantly increase parallelism
+			Int32 maxConcurrentOperations = processorCount * 8;  // Much higher concurrency
+			Int32 fileQueueSize = processorCount * 20; // Larger queue to keep CPU fed
+			Int32 directoryParallelism = Math.Max(8, processorCount / 2); // Process multiple directories simultaneously
+			Int32 enumBatchSize = 1000; // Batch file enumeration for better performance
+
+			Logger.LogInfo($"Configuring for high parallelism: {maxConcurrentOperations} concurrent operations, {fileQueueSize} queue size");
 
 			// Create performance tracker
 			PerformanceTracker performanceTracker = new PerformanceTracker();
 			performanceTracker.Start();
 
+			// Track global statistics
+			ConcurrentDictionary<String, Boolean> globalVisitedPaths = new ConcurrentDictionary<String, Boolean>();
+			Int64 totalFilesProcessed = 0;
+			Int64 totalBytesProcessed = 0;
+			Int64 totalErrorsEncountered = 0;
+			Int64 totalDirectoriesProcessed = 0;
+
 			try {
-				// Process each drive's directories in parallel
-				List<Task> driveTasks = new List<Task>();
+				// Create a single ActionBlock for file processing with a very high degree of parallelism
+				// This allows files from any directory to be processed as capacity is available
+				ExecutionDataflowBlockOptions blockOptions = new ExecutionDataflowBlockOptions {
+					MaxDegreeOfParallelism = maxConcurrentOperations,
+					BoundedCapacity = fileQueueSize,
+					EnsureOrdered = false,
+					SingleProducerConstrained = false
+				};
 
-				foreach (var driveGroup in directoriesByDrive) {
-					String driveLetter = driveGroup.Key;
-					List<String> driveDirectories = driveGroup.Value;
 
-					// Create a task to process all directories on this drive
-					Task driveTask = Task.Run(async () => {
-						Logger.LogInfo($"Starting processing for drive {driveLetter} with {driveDirectories.Count} directories");
+				// Create a custom IoPerformanceThrottler with higher concurrency limits
+				IoPerformanceThrottler highPerfThrottler = new IoPerformanceThrottler(
+						initialConcurrentOperations: Math.Min(maxConcurrentOperations / 2, Environment.ProcessorCount * 3),  // Start with a safer value
+						ioThresholdMBPerSec:2500.0  // Set a high threshold to encourage max throughput
+				);
 
-						// Create an I/O throttler specific to this drive
-						IoPerformanceThrottler driveThrottler = new IoPerformanceThrottler();
 
-						// Process directories on this drive sequentially
-						foreach (String directory in driveDirectories) {
-							Logger.LogInfo($"Processing directory on drive {driveLetter}: {directory}");
-							await ProcessDirectoryAsync(directory, driveThrottler);
+				// Create an ActionBlock that will process files in parallel
+				ActionBlock<String> globalFileProcessor = new ActionBlock<String>(
+						async filePath => {
+							try {
+								// Process each file and track statistics
+								FileInfo fileInfo = new FileInfo(filePath);
+								FileProcessingResult result = await ProcessFileAsync(filePath, highPerfThrottler);
+
+								if (result.Success) {
+									Interlocked.Increment(ref totalFilesProcessed);
+									Interlocked.Add(ref totalBytesProcessed, fileInfo.Length);
+
+									// Periodically log progress
+									if (totalFilesProcessed % 10000 == 0) {
+										Logger.LogInfo($"Progress: {totalFilesProcessed:N0} files ({(totalBytesProcessed / (1024.0 * 1024.0)):N2} MB), {totalDirectoriesProcessed:N0} directories");
+									}
+								}
+								else {
+									Interlocked.Increment(ref totalErrorsEncountered);
+								}
+							}
+							catch (Exception ex) {
+								Logger.LogError($"Error in file processor: {ex.Message}");
+								Interlocked.Increment(ref totalErrorsEncountered);
+							}
+						},
+						blockOptions
+				);
+
+				// Process directories in parallel
+				List<Task> directoryTasks = new List<Task>();
+				SemaphoreSlim directorySemaphore = new SemaphoreSlim(directoryParallelism);
+
+				foreach (String rootDir in validDirectories) {
+					// Throttle the number of concurrent directory traversals
+					await directorySemaphore.WaitAsync();
+
+					// Process this directory asynchronously
+					Task directoryTask = Task.Run(async () => {
+						try {
+							Logger.LogInfo($"Starting directory traversal: {rootDir}");
+
+							// Use a queue for breadth-first directory traversal
+							ConcurrentQueue<String> directoriesToProcess = new ConcurrentQueue<String>();
+							directoriesToProcess.Enqueue(rootDir);
+
+							List<Task> workerTasks = new List<Task>();
+							SemaphoreSlim workerSemaphore = new SemaphoreSlim(directoryParallelism * 2);
+
+							// Start multiple worker tasks to process directories in parallel
+							for (Int32 i = 0; i < directoryParallelism; i++) {
+								workerTasks.Add(Task.Run(async () => {
+									String currentDir;
+
+									// Process directories until the queue is empty
+									while (directoriesToProcess.TryDequeue(out currentDir) || !IsQueueEmpty()) {
+										if (currentDir == null) {
+											// If we didn't get a directory, check if other workers are still active
+											await Task.Delay(10);
+											continue;
+										}
+
+										Interlocked.Increment(ref totalDirectoriesProcessed);
+
+										try {
+											// Process files in batches for better performance
+											List<String> fileBatch = new List<String>(enumBatchSize);
+
+											// Find all files in the current directory
+											foreach (String filePath in Directory.EnumerateFiles(currentDir)) {
+												try {
+													FileInfo fileInfo = new FileInfo(filePath);
+
+													// Handle symbolic links to avoid cycles
+													if ((fileInfo.Attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint) {
+														String? targetPath = ResolveSymbolicLink(filePath);
+
+														if (!String.IsNullOrEmpty(targetPath)) {
+															if (!globalVisitedPaths.TryAdd(targetPath.ToLowerInvariant(), true)) {
+																continue; // Skip already visited links
+															}
+														}
+													}
+
+													// Add to the batch
+													fileBatch.Add(filePath);
+
+													// When batch is full, send to processor
+													if (fileBatch.Count >= enumBatchSize) {
+														await SendFileBatchAsync(fileBatch, globalFileProcessor);
+														fileBatch = new List<String>(enumBatchSize);
+													}
+												}
+												catch (Exception ) {
+													Interlocked.Increment(ref totalErrorsEncountered);
+													// Continue with next file
+												}
+											}
+
+											// Send any remaining files in the batch
+											if (fileBatch.Count > 0) {
+												await SendFileBatchAsync(fileBatch, globalFileProcessor);
+											}
+
+											// Queue all subdirectories for processing
+											foreach (String dirPath in Directory.EnumerateDirectories(currentDir)) {
+												try {
+													DirectoryInfo dirInfo = new DirectoryInfo(dirPath);
+
+													// Handle directory symbolic links
+													if ((dirInfo.Attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint) {
+														String? targetPath = ResolveSymbolicLink(dirPath);
+
+														if (!String.IsNullOrEmpty(targetPath)) {
+															if (!globalVisitedPaths.TryAdd(targetPath.ToLowerInvariant(), true)) {
+																continue; // Skip already visited links
+															}
+															directoriesToProcess.Enqueue(targetPath);
+														}
+														continue;
+													}
+
+													// Queue regular directories for processing
+													directoriesToProcess.Enqueue(dirPath);
+												}
+												catch (UnauthorizedAccessException) {
+													// Skip inaccessible directories
+													Interlocked.Increment(ref totalErrorsEncountered);
+												}
+												catch (Exception ) {
+													Interlocked.Increment(ref totalErrorsEncountered);
+												}
+											}
+										}
+										catch (UnauthorizedAccessException) {
+											// Skip inaccessible directories
+											Interlocked.Increment(ref totalErrorsEncountered);
+										}
+										catch (Exception ) {
+											Interlocked.Increment(ref totalErrorsEncountered);
+										}
+									}
+								}));
+							}
+
+							// Helper function to check if the queue is completely empty
+							Boolean IsQueueEmpty() {
+								return directoriesToProcess.IsEmpty;
+							}
+
+							// Wait for all worker tasks to finish
+							await Task.WhenAll(workerTasks);
+
+							Logger.LogInfo($"Completed directory traversal: {rootDir}");
 						}
-
-						Logger.LogInfo($"Completed processing for drive {driveLetter}");
+						catch (Exception ex) {
+							Logger.LogError($"Error processing directory tree {rootDir}: {ex.Message}");
+						}
+						finally {
+							// Release the semaphore to allow processing another root directory
+							directorySemaphore.Release();
+						}
 					});
 
-					driveTasks.Add(driveTask);
+					directoryTasks.Add(directoryTask);
 				}
 
-				// Wait for all drive processing to complete
-				await Task.WhenAll(driveTasks);
+				// Helper method to send batches of files to the processor
+				async Task SendFileBatchAsync(List<String> fileBatch, ActionBlock<String> processor) {
+					foreach (String filePath in fileBatch) {
+						// Keep trying to send files, with backoff if the queue is full
+						Boolean accepted = false;
+						Int32 retryCount = 0;
 
-				// Log completion statistics
+						while (!accepted) {
+							accepted = await processor.SendAsync(filePath);
+
+							if (!accepted) {
+								retryCount++;
+								Int32 delayMs = Math.Min(100 * retryCount, 1000);
+								await Task.Delay(delayMs);
+							}
+						}
+					}
+				}
+
+				// Wait for all directory tasks to complete
+				await Task.WhenAll(directoryTasks);
+
+				// Complete the processor and wait for all queued files to finish processing
+				Logger.LogInfo("All directories traversed, waiting for file processing to complete...");
+				globalFileProcessor.Complete();
+				await globalFileProcessor.Completion;
+
+				// Log final statistics
 				performanceTracker.Stop();
 				Logger.LogInfo($"Processing complete in {performanceTracker.ElapsedTime.TotalSeconds:F2} seconds");
+				Logger.LogInfo($"Directories processed: {totalDirectoriesProcessed:N0}");
+				Logger.LogInfo($"Files processed: {totalFilesProcessed:N0}");
+				Logger.LogInfo($"Total data: {(totalBytesProcessed / (1024.0 * 1024.0)):N2} MB");
+				Logger.LogInfo($"Errors encountered: {totalErrorsEncountered:N0}");
 				Logger.LogInfo($"Peak memory usage: {performanceTracker.PeakMemoryUsageMB:F2} MB");
+
+				// Calculate performance metrics
+				Double filesPerSecond = totalFilesProcessed / performanceTracker.ElapsedTime.TotalSeconds;
+				Double mbPerSecond = (totalBytesProcessed / (1024.0 * 1024.0)) / performanceTracker.ElapsedTime.TotalSeconds;
+
+				Logger.LogInfo($"Performance: {filesPerSecond:F2} files/sec, {mbPerSecond:F2} MB/sec");
 			}
 			catch (Exception ex) {
 				Logger.LogError($"Unhandled exception in main processing: {ex}");
 				Console.WriteLine("An error occurred during processing. Check logs for details.");
 			}
 
-			Console.WriteLine("Processing complete!");
+			Console.WriteLine($"Processing complete! Processed {totalFilesProcessed:N0} files ({(totalBytesProcessed / (1024.0 * 1024.0)):N2} MB)");
 		}
+
+		/// <summary>
+		/// Gets the available memory in megabytes
+		/// </summary>
+		private static Int64 GetAvailableMemoryMB() {
+			try {
+				using (Process process = Process.GetCurrentProcess()) {
+					return (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024 * 1024));
+				}
+			}
+			catch {
+				return 8192; // Default to 8GB if we can't determine
+			}
+		}
+
 
 		/// <summary>
 		/// Recursively processes all files in a directory and its subdirectories.
@@ -436,7 +581,7 @@ namespace FileMunger {
 		static String? ResolveSymbolicLink(String linkPath) {
 			try {
 				Logger.LogDebug($"Resolving symbolic link: {linkPath}");
-				String targetPath = NativeMethods.GetFinalPathName(linkPath);
+				String? targetPath = NativeMethods.GetFinalPathName(linkPath);
 				Logger.LogDebug($"Link target: {targetPath}");
 				return targetPath;
 			}
@@ -451,7 +596,7 @@ namespace FileMunger {
 	/// Result of a file processing operation.
 	/// </summary>
 	public class FileProcessingResult {
-		public String FilePath { get; set; } = String.Empty; // Initialize with empty string
+		public String? FilePath { get; set; } = String.Empty; // Initialize with empty string
 		public Boolean Success { get; set; }
 		public String? ErrorMessage { get; set; } // Mark as nullable
 	}
@@ -565,6 +710,7 @@ namespace FileMunger {
 		}
 	}
 
+
 	/// <summary>
 	/// Native Windows API methods for handling symbolic links
 	/// </summary>
@@ -586,38 +732,99 @@ namespace FileMunger {
 		[return: MarshalAs(UnmanagedType.Bool)]
 		private static extern Boolean CloseHandle(IntPtr hObject);
 
+		[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+		private static extern Int32 FormatMessage(
+				UInt32 dwFlags,
+				IntPtr lpSource,
+				Int32 dwMessageId,
+				Int32 dwLanguageId,
+				StringBuilder lpBuffer,
+				Int32 nSize,
+				IntPtr Arguments);
+
 		// Windows-specific constants
 		private const UInt32 FILE_READ_ATTRIBUTES = 0x80;
+		private const UInt32 FILE_WRITE_ATTRIBUTES = 0x0100;
 		private const UInt32 FILE_SHARE_READ = 0x1;
 		private const UInt32 FILE_SHARE_WRITE = 0x2;
 		private const UInt32 OPEN_EXISTING = 3;
 		private const UInt32 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
 		private const Int32 FILE_NAME_NORMALIZED = 0x0;
+		private const UInt32 FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000;
+		private const UInt32 FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200;
+
+		/// <summary>
+		/// Gets a readable description for a Win32 error code
+		/// </summary>
+		private static String GetWin32ErrorMessage(Int32 errorCode) {
+			try {
+				StringBuilder message = new StringBuilder(1024);
+				Int32 size = FormatMessage(
+						FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+						IntPtr.Zero,
+						errorCode,
+						0, // Default language
+						message,
+						message.Capacity,
+						IntPtr.Zero);
+
+				if (size > 0) {
+					return message.ToString().Trim();
+				}
+			}
+			catch (Exception) {
+				// Fall back to just the error code if we can't get the message
+			}
+
+			return $"Unknown error {errorCode}";
+		}
 
 		/// <summary>
 		/// Gets the final path name for a file, resolving any symbolic links
 		/// </summary>
 		/// <param name="path">The path to resolve</param>
-		/// <returns>The resolved final path</returns>
-		public static String GetFinalPathName(String path) {
-			Logger.LogDebug($"Resolving path with Windows API: {path}");
+		/// <param name="readOnly">If true, opens file with read-only access; if false, opens with read-write access</param>
+		/// <returns>The resolved final path, or null if resolution fails</returns>
+		public static String? GetFinalPathName(String path, Boolean readOnly = true) {
+			Logger.LogDebug($"Resolving path with Windows API (readOnly={readOnly}): {path}");
 
-			// Open a handle to the file or directory
-			IntPtr handle = CreateFile(path,
-					FILE_READ_ATTRIBUTES,
-					FILE_SHARE_READ | FILE_SHARE_WRITE,
-					IntPtr.Zero,
-					OPEN_EXISTING,
-					FILE_FLAG_BACKUP_SEMANTICS, // Required for directories
-					IntPtr.Zero);
-
-			if (handle == new IntPtr(-1)) {
-				Int32 error = Marshal.GetLastWin32Error();
-				Logger.LogWarning($"CreateFile failed for '{path}'. Error: {error}");
-				throw new IOException($"Could not open file: {path}. Error: {error}");
-			}
+			IntPtr handle = IntPtr.Zero;
 
 			try {
+				// Set access and share mode based on readOnly parameter
+				UInt32 desiredAccess = readOnly
+						? FILE_READ_ATTRIBUTES
+						: FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES;
+
+				UInt32 shareMode = readOnly
+						? FILE_SHARE_READ | FILE_SHARE_WRITE
+						: FILE_SHARE_READ;
+
+				// Open a handle to the file or directory
+				handle = CreateFile(
+						path,
+						desiredAccess,
+						shareMode,
+						IntPtr.Zero,
+						OPEN_EXISTING,
+						FILE_FLAG_BACKUP_SEMANTICS, // Required for directories
+						IntPtr.Zero);
+
+				if (handle == new IntPtr(-1)) {
+					Int32 error = Marshal.GetLastWin32Error();
+					String errorMessage = GetWin32ErrorMessage(error);
+
+					Logger.LogWarning($"CreateFile failed for '{path}' (readOnly={readOnly}). Error {error}: {errorMessage}");
+
+					// If failed with read-write access, retry with read-only access
+					if (!readOnly) {
+						Logger.LogDebug($"Retrying '{path}' with read-only access");
+						return GetFinalPathName(path, true);
+					}
+
+					return null;
+				}
+
 				StringBuilder result = new StringBuilder(512);
 				Int32 length = GetFinalPathNameByHandle(handle, result, result.Capacity, FILE_NAME_NORMALIZED);
 
@@ -637,14 +844,24 @@ namespace FileMunger {
 				}
 
 				Int32 finalError = Marshal.GetLastWin32Error();
-				Logger.LogWarning($"GetFinalPathNameByHandle failed. Error: {finalError}");
-				throw new IOException($"Failed to get final path. Error: {finalError}");
+				String finalErrorMessage = GetWin32ErrorMessage(finalError);
+				Logger.LogWarning($"GetFinalPathNameByHandle failed for '{path}'. Error {finalError}: {finalErrorMessage}");
+				return null;
+			}
+			catch (Exception ex) {
+				Logger.LogWarning($"Exception resolving path '{path}': {ex.GetType().Name}: {ex.Message}");
+				return null;
 			}
 			finally {
-				CloseHandle(handle);
+				// Always close the handle if it was opened successfully
+				if (handle != IntPtr.Zero && handle != new IntPtr(-1)) {
+					CloseHandle(handle);
+				}
 			}
 		}
 	}
+
+
 
 	/// <summary>
 	/// Tracks application performance metrics like memory usage and execution time
@@ -720,9 +937,12 @@ namespace FileMunger {
 				Int32 initialConcurrentOperations = 4,
 				Double ioThresholdMBPerSec = 80.0) {
 
-			_maxConcurrentOperations = Math.Max(1, Environment.ProcessorCount);
+			_maxConcurrentOperations = Math.Max(16, Environment.ProcessorCount * 4); // Increase max limit
 			_ioThresholdMBPerSec = ioThresholdMBPerSec;
-			_currentLimit = initialConcurrentOperations;
+
+			// Ensure initialConcurrentOperations doesn't exceed the maximum
+			_currentLimit = Math.Min(initialConcurrentOperations, _maxConcurrentOperations);
+
 			_throttleSemaphore = new SemaphoreSlim(_currentLimit, _maxConcurrentOperations);
 
 			Logger.LogInfo($"I/O Throttler initialized with {_currentLimit} concurrent operations (max: {_maxConcurrentOperations})");
@@ -744,6 +964,7 @@ namespace FileMunger {
 				_performanceCountersAvailable = false;
 			}
 		}
+
 
 		/// <summary>
 		/// Gets throttled access for an I/O operation
